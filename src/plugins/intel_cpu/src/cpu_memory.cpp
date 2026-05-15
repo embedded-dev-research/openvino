@@ -556,7 +556,7 @@ void StaticMemory::StaticMemoryBlock::unregisterMemory(Memory* memPtr) {
     // do nothing
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 #    define MPOL_DEFAULT   0
 #    define MPOL_BIND      2
 #    define MPOL_MF_STRICT (1 << 0)
@@ -577,7 +577,11 @@ static int64_t mbind(void* start, uint64_t len, int mode, const uint64_t* nmask,
 }
 #endif
 
-#if defined(__linux__)
+#if defined(__ANDROID__)
+bool mbind_move([[maybe_unused]] void* data, [[maybe_unused]] size_t size, [[maybe_unused]] int targetNode) {
+    return true;
+}
+#elif defined(__linux__)
 bool mbind_move(void* data, size_t size, int targetNode) {
     int realNode = ov::get_org_numa_id(targetNode);
     auto pagesize = getpagesize();
