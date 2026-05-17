@@ -106,6 +106,60 @@ static void compress_cache(const PlainTensor& cur,
     }
 }
 
+static uint8_t read_u4_value(const uint8_t* packed_data, size_t element_index) {
+    const uint8_t packed = packed_data[element_index / 2];
+    const bool high_half = (element_index % 2) == 0;
+    const uint8_t shift = high_half ? 4 : 0;
+    return static_cast<uint8_t>((packed >> shift) & 0x0F);
+}
+
+static float decode_cache_value(const PlainTensor& cache,
+                                const PlainTensor& scale_zp,
+                                ov::Extensions::Cpu::CacheCodec codec,
+                                size_t group_size,
+                                size_t b,
+                                size_t h,
+                                size_t pos,
+                                size_t dim) {
+    switch (codec) {
+    case ov::Extensions::Cpu::CacheCodec::RAW_F32:
+        return cache.at<float>({b, h, pos, dim});
+    case ov::Extensions::Cpu::CacheCodec::RAW_F16:
+        return static_cast<float>(cache.at<ov::float16>({b, h, pos, dim}));
+    case ov::Extensions::Cpu::CacheCodec::RAW_BF16:
+        return static_cast<float>(cache.at<ov::bfloat16>({b, h, pos, dim}));
+    case ov::Extensions::Cpu::CacheCodec::U8: {
+        OPENVINO_ASSERT(scale_zp, "Grouped u8 KV cache requires scale/zp tensor");
+        const size_t group_id = dim / group_size;
+        const size_t in_group_offset = dim % group_size;
+        const auto* row = static_cast<const uint8_t*>(cache.ptr_v(b, h, pos, 0));
+        const auto* szp = scale_zp.ptr<float>(pos, b, h);
+        const float scale = szp[group_id * 2];
+        const float zp = szp[group_id * 2 + 1];
+        return (static_cast<float>(row[group_id * group_size + in_group_offset]) - zp) * scale;
+    }
+    case ov::Extensions::Cpu::CacheCodec::U4: {
+        OPENVINO_ASSERT(scale_zp, "Grouped u4 KV cache requires scale/zp tensor");
+        const size_t group_id = dim / group_size;
+        const size_t in_group_offset = dim % group_size;
+        const size_t group_bytes = group_size / 2;
+        const auto* row = static_cast<const uint8_t*>(cache.ptr_v(b, h, pos, 0));
+        const auto* szp = scale_zp.ptr<float>(pos, b, h);
+        const float scale = szp[group_id * 2];
+        const float zp = szp[group_id * 2 + 1];
+        return (static_cast<float>(read_u4_value(row + group_id * group_bytes, in_group_offset)) - zp) * scale;
+    }
+    case ov::Extensions::Cpu::CacheCodec::U8_BY_CHANNEL: {
+        OPENVINO_ASSERT(scale_zp, "By-channel u8 KV cache requires scale/zp tensor");
+        const size_t group_id = pos / group_size;
+        const auto* scale = scale_zp.ptr<float>(group_id * 2, b, h);
+        const auto* zp = scale_zp.ptr<float>(group_id * 2 + 1, b, h);
+        return (static_cast<float>(cache.at<uint8_t>({b, h, pos, dim})) - zp[dim]) * scale[dim];
+    }
+    }
+    OPENVINO_THROW("Unsupported KV cache codec in SDPA fallback");
+}
+
 struct ScaledDotProductAttentionKey {
     ov::element::Type rtPrecision;
 
@@ -1683,23 +1737,30 @@ struct ScaledDotProductAttention::AttentionExecutor : public ScaledDotProductAtt
                         std::vector<float> k_f32(kv_len * head_size);
                         std::vector<float> v_f32(kv_len * head_size_v);
 
-                        const size_t k_stride_m = present_key.stride(2);
-                        const size_t k_stride_s = present_key.stride(3);
-                        const ov::float16* k_ptr = &present_key.at<ov::float16>({b, hk, 0, 0});
                         for (size_t n = 0; n < kv_len; n++) {
-                            const ov::float16* k_row = k_ptr + n * k_stride_m;
                             for (size_t s = 0; s < head_size; s++) {
-                                k_f32[n * head_size + s] = static_cast<float>(k_row[s * k_stride_s]);
+                                k_f32[n * head_size + s] = decode_cache_value(present_key,
+                                                                               k_scale_zp,
+                                                                               k_codec,
+                                                                               kernel_single_token.m_key_group_size,
+                                                                               b,
+                                                                               hk,
+                                                                               n,
+                                                                               s);
                             }
                         }
 
-                        const size_t v_stride_m = present_value.stride(2);
-                        const size_t v_stride_s = present_value.stride(3);
-                        const ov::float16* v_ptr = &present_value.at<ov::float16>({b, hk, 0, 0});
                         for (size_t n = 0; n < kv_len; n++) {
-                            const ov::float16* v_row = v_ptr + n * v_stride_m;
                             for (size_t s = 0; s < head_size_v; s++) {
-                                v_f32[n * head_size_v + s] = static_cast<float>(v_row[s * v_stride_s]);
+                                v_f32[n * head_size_v + s] =
+                                    decode_cache_value(present_value,
+                                                       v_scale_zp,
+                                                       v_codec,
+                                                       kernel_single_token.m_value_group_size,
+                                                       b,
+                                                       hk,
+                                                       n,
+                                                       s);
                             }
                         }
 
